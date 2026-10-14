@@ -2,87 +2,193 @@ from fastapi import APIRouter
 import yfinance as yf
 import numpy as np
 import pandas as pd
-from utils.cache import DATA_CACHE
+from database import SessionLocal
+from models.stock_price import StockPrice
 
 router = APIRouter()
 
+
 @router.get("/api/sentiment/{ticker}")
 def market_sentiment(ticker: str):
-    """Get market sentiment and technical indicators"""
+    db = SessionLocal()
+
     try:
-        data = yf.download(ticker, period="6mo", interval="1d")
-        if data.empty:
-            return {"error": {"message": "No data found for ticker", "suggestion": "Check if the ticker symbol is correct or try again later."}}
-        if 'Close' not in data.columns:
-            return {"error": {"message": "Close price data not available", "suggestion": "Try a different ticker or check data source."}}
-        close = data['Close'].dropna()
-        if isinstance(close, pd.DataFrame):
-            if close.shape[1] == 1:
-                close = close.iloc[:, 0]
-            else:
-                close = close.squeeze()
-        close = close if isinstance(close, pd.Series) else pd.Series(close)
+        # 1. Read historical closing prices from SQLite
+        rows = (
+            db.query(StockPrice)
+            .filter(StockPrice.ticker == ticker.upper())
+            .order_by(StockPrice.trade_date.asc())
+            .all()
+        )
+
+        close = pd.Series(
+            [row.close_price for row in rows],
+            index=pd.to_datetime([row.trade_date for row in rows]),
+            dtype=float,
+        )
+
+        # 2. Fall back to Yahoo Finance if SQLite has insufficient data
         if len(close) < 50:
-            return {"error": {"message": "Not enough data for sentiment analysis", "suggestion": "Try a different ticker or wait for more data to accumulate."}}
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="6mo", interval="1d")
+
+            if hist.empty or "Close" not in hist.columns:
+                return {"error": f"No historical data available for {ticker}"}
+
+            close = hist["Close"].dropna()
+
+            # 3. Save fetched daily prices to SQLite
+            if not close.empty:
+                for date, price in close.items():
+                    trade_date = pd.Timestamp(date).date().isoformat()
+
+                    existing = (
+                        db.query(StockPrice)
+                        .filter(
+                            StockPrice.ticker == ticker.upper(),
+                            StockPrice.trade_date == trade_date,
+                        )
+                        .first()
+                    )
+
+                    if existing:
+                        existing.close_price = float(price)
+                    else:
+                        db.add(
+                            StockPrice(
+                                ticker=ticker.upper(),
+                                trade_date=trade_date,
+                                close_price=float(price),
+                            )
+                        )
+
+                db.commit()
+
+        # 4. Ensure enough data exists for sentiment calculations
+        close = close.dropna()
+
+        if len(close) < 50:
+            return {
+                "error": f"Insufficient historical data for {ticker}"
+            }
+
+        # 5. Calculate moving averages
+        ma_20 = close.rolling(window=20).mean()
+        ma_50 = close.rolling(window=50).mean()
+
         current_price = float(close.iloc[-1])
-        ma_20 = float(close.rolling(window=20).mean().iloc[-1])
-        ma_50 = float(close.rolling(window=50).mean().iloc[-1])
-        if pd.isna(ma_20):
-            ma_20 = current_price
-        if pd.isna(ma_50):
-            ma_50 = current_price
+        current_ma20 = float(ma_20.iloc[-1])
+        current_ma50 = float(ma_50.iloc[-1])
+
+        # 6. Calculate RSI
         delta = close.diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        avg_gain = gain.rolling(window=14).mean()
-        avg_loss = loss.rolling(window=14).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi_series = 100 - (100 / (1 + rs))
-        rsi = float(rsi_series.iloc[-1])
-        if pd.isna(rsi):
-            rsi = 50.0
-        if len(close) >= 6:
-            momentum_5d = float((current_price / close.iloc[-6]) - 1)
+        gains = delta.clip(lower=0)
+        losses = -delta.clip(upper=0)
+
+        avg_gain = gains.rolling(window=14).mean()
+        avg_loss = losses.rolling(window=14).mean()
+
+        relative_strength = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + relative_strength))
+        current_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+
+        # 7. Calculate momentum
+        momentum_5d = (
+            float((close.iloc[-1] / close.iloc[-6] - 1) * 100)
+            if len(close) >= 6 and close.iloc[-6] != 0
+            else 0.0
+        )
+
+        momentum_20d = (
+            float((close.iloc[-1] / close.iloc[-21] - 1) * 100)
+            if len(close) >= 21 and close.iloc[-21] != 0
+            else 0.0
+        )
+
+        # 8. Calculate recent and previous volatility
+        daily_returns = close.pct_change().dropna()
+
+        recent_volatility = (
+            float(daily_returns.tail(20).std() * np.sqrt(252) * 100)
+            if len(daily_returns) >= 20
+            else 0.0
+        )
+
+        previous_volatility = (
+            float(daily_returns.iloc[-40:-20].std() * np.sqrt(252) * 100)
+            if len(daily_returns) >= 40
+            else recent_volatility
+        )
+
+        if recent_volatility > previous_volatility * 1.1:
+            volatility_trend = "increasing"
+        elif recent_volatility < previous_volatility * 0.9:
+            volatility_trend = "decreasing"
         else:
-            momentum_5d = 0.0
-        if len(close) >= 21:
-            momentum_20d = float((current_price / close.iloc[-21]) - 1)
-        else:
-            momentum_20d = 0.0
-        recent_vol = float(close.pct_change().tail(20).std())
-        historical_vol = float(close.pct_change().std())
-        vol_trend = "increasing" if recent_vol > historical_vol else "decreasing"
+            volatility_trend = "stable"
+
+        # 9. Generate sentiment signals
         signals = []
-        if current_price > ma_20 and ma_20 > ma_50:
+
+        if current_price > current_ma20 > current_ma50:
             signals.append("bullish_trend")
-        elif current_price < ma_20 and ma_20 < ma_50:
+
+        if current_price < current_ma20 < current_ma50:
             signals.append("bearish_trend")
-        if rsi > 70:
+
+        if current_rsi > 70:
             signals.append("overbought")
-        elif rsi < 30:
+        elif current_rsi < 30:
             signals.append("oversold")
-        if momentum_5d > 0.05:
+
+        if momentum_5d > 2:
             signals.append("strong_momentum")
-        elif momentum_5d < -0.05:
+        elif momentum_5d < -2:
             signals.append("weak_momentum")
-        bullish_signals = len([s for s in signals if "bullish" in s or "strong" in s])
-        bearish_signals = len([s for s in signals if "bearish" in s or "weak" in s])
-        sentiment_score = bullish_signals - bearish_signals
+
+        # 10. Calculate sentiment score
+        sentiment_score = 0
+
+        if current_price > current_ma20:
+            sentiment_score += 1
+        else:
+            sentiment_score -= 1
+
+        if current_ma20 > current_ma50:
+            sentiment_score += 1
+        else:
+            sentiment_score -= 1
+
+        if current_rsi > 50:
+            sentiment_score += 1
+        else:
+            sentiment_score -= 1
+
+        if momentum_5d > 0:
+            sentiment_score += 1
+        else:
+            sentiment_score -= 1
+
+        # 11. Return the existing response structure
         return {
             "current_price": current_price,
             "moving_averages": {
-                "ma_20": ma_20,
-                "ma_50": ma_50
+                "ma_20": current_ma20,
+                "ma_50": current_ma50,
             },
             "technical_indicators": {
-                "rsi": rsi,
+                "rsi": current_rsi,
                 "momentum_5d": momentum_5d,
-                "momentum_20d": momentum_20d
+                "momentum_20d": momentum_20d,
             },
-            "volatility_trend": vol_trend,
+            "volatility_trend": volatility_trend,
             "signals": signals,
-            "sentiment_score": sentiment_score
+            "sentiment_score": sentiment_score,
         }
+
     except Exception as e:
-        print(f"Error in /api/sentiment for {ticker}: {e}")
-        return {"error": {"message": f"Sentiment analysis failed: {str(e)}", "suggestion": "Try again later or contact support if the issue persists."}} 
+        db.rollback()
+        return {"error": str(e)}
+
+    finally:
+        db.close()
