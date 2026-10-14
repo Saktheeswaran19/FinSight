@@ -190,5 +190,7 @@ def market_sentiment(ticker: str):
         db.rollback()
         return {"error": str(e)}
 
+
+
     finally:
         db.close()
