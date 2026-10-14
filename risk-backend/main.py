@@ -315,7 +315,7 @@ def predict_prices(req: PredictRequest):
                     close_price = float(price)
 
                     if trade_date in existing_by_date:
-                        existing_by_date[trade_date].close_price = trade_data
+                        existing_by_date[trade_date].close_price = close_price
                     else:
                         db.add(
                             StockPrice(
