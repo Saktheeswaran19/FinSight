@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+yfinance
+numpy
+pandas
+python-dotenv
+apscheduler
+statsmodels
+scikit-learn
+psutil
+# For modular imports and scheduling
+importlib-metadata; python_version<'3.8'
