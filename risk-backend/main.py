@@ -16,10 +16,14 @@ from utils.cache import DATA_CACHE, scheduler
 from routes.metrics import router as metrics_router
 from routes.portfolio import router as portfolio_router
 from routes.sentiment import router as sentiment_router
+from database import Base, SessionLocal, engine
+from models.stock_price import StockPrice
+from datetime import date
 
 load_dotenv()
 
 app = FastAPI()
+Base.metadata.create_all(bind=engine)
 
 # Allow frontend to access backend
 app.add_middleware(
@@ -34,6 +38,57 @@ TICKERS = os.getenv("TICKERS", "RELIANCE.NS,HDFCBANK.NS,ICICIBANK.NS,INFY.NS,TCS
 
 # Move update_cache to utils/cache.py or define here and import if needed
 from utils.cache import DATA_CACHE
+
+def save_stock_prices(ticker: str, close: pd.Series):
+    """Insert or update historical closing prices in SQLite."""
+    db = SessionLocal()
+
+    try:
+        # Load existing dates for this ticker to prevent duplicates.
+        existing_rows = (
+            db.query(StockPrice)
+            .filter(StockPrice.ticker == ticker)
+            .all()
+        )
+        existing_by_date = {
+            row.trade_date: row for row in existing_rows
+        }
+
+        changed = False
+
+        for timestamp, price in close.items():
+            if pd.isna(price):
+                continue
+
+            trade_date = pd.Timestamp(timestamp).date()
+            close_price = float(price)
+
+            existing = existing_by_date.get(trade_date)
+
+            if existing:
+                # Update a price if Yahoo Finance has revised it.
+                if existing.close_price != close_price:
+                    existing.close_price = close_price
+                    changed = True
+            else:
+                db.add(
+                    StockPrice(
+                        ticker=ticker,
+                        trade_date=trade_date,
+                        close_price=close_price,
+                    )
+                )
+                changed = True
+
+        if changed:
+            db.commit()
+
+    except Exception as e:
+        db.rollback()
+        print(f"Error saving SQLite prices for {ticker}: {e}")
+
+    finally:
+        db.close()
 
 def update_cache():
     for ticker in TICKERS:
@@ -56,6 +111,7 @@ def update_cache():
                         else:
                             close = close.squeeze()
                     close = close if isinstance(close, pd.Series) else pd.Series(close)
+                    save_stock_prices(ticker, close)
                     if len(close) >= 30:
                         returns = close.pct_change().dropna()
                         volatility = float(np.std(returns) * np.sqrt(252))
@@ -192,31 +248,6 @@ def get_metrics(ticker: str = Query(..., description="Stock ticker symbol")) -> 
             return {"error": {"message": str(e), "suggestion": "Try again later or contact support if the issue persists."}}
     return DATA_CACHE[ticker]["metrics"]
 
-@app.get("/api/history")
-def get_history(ticker: str = Query(..., description="Stock ticker symbol")) -> Dict:
-    if not DATA_CACHE or ticker not in DATA_CACHE:
-        try:
-            data = yf.download(ticker, period="1y", interval="1d")
-            if data.empty:
-                return {"error": {"message": "No data found for ticker.", "suggestion": "Check if the ticker symbol is correct or try again later."}}
-            close = data['Close']
-            if isinstance(close, pd.DataFrame):
-                if close.shape[1] == 1:
-                    close = close.iloc[:, 0]
-                else:
-                    close = close.squeeze()
-            close = close if isinstance(close, pd.Series) else pd.Series(close)
-            return {
-                "history": close.tolist(),
-                "dates": [str(d.date()) for d in close.index]
-            }
-        except Exception as e:
-            print(f"Error in /api/history for {ticker}: {e}")
-            return {"error": {"message": str(e), "suggestion": "Try again later or contact support if the issue persists."}}
-    return {
-        "history": DATA_CACHE[ticker]["history"],
-        "dates": DATA_CACHE[ticker]["dates"]
-    }
 
 @app.get("/api/risk_alerts")
 def risk_alerts(threshold: float = 0.05) -> Dict:
@@ -228,73 +259,131 @@ class PredictRequest(BaseModel):
     ticker: str
     days: int = 7
 
+
 @app.post("/api/predict")
 def predict_prices(req: PredictRequest):
     ticker = req.ticker
-    days = min(max(req.days, 1), 30)  # Clamp days between 1 and 30
-    
-    # If cache is empty or ticker not in cache, fetch data on-demand
-    if not DATA_CACHE or ticker not in DATA_CACHE:
-        try:
-            data = yf.download(ticker, period="6mo", interval="1d")
-            if data is None or data.empty:
-                return {"error": {"message": "No data found for ticker.", "suggestion": "Check if the ticker symbol is correct or try again later."}}
-            # Try to get the 'Close' column robustly
-            close_col = None
-            # Handle both single and multi-index columns
-            if isinstance(data.columns, pd.MultiIndex):
-                for col in data.columns:
-                    if "close" in str(col).lower():
-                        close_col = col
-                        break
-            else:
-                for col in data.columns:
-                    if "close" in str(col).lower():
-                        close_col = col
-                        break
-            if not close_col:
-                return {"error": {"message": f"No 'Close' column found in data. Columns: {list(data.columns)}", "suggestion": "Try a different ticker or check data source."}}
-            close_prices = data[close_col].dropna()
-            if isinstance(close_prices, pd.DataFrame):
-                if close_prices.shape[1] == 1:
-                    close_prices = close_prices.iloc[:, 0]
-                else:
-                    close_prices = close_prices.squeeze()
-            close_prices = close_prices if isinstance(close_prices, pd.Series) else pd.Series(close_prices)
-            if len(close_prices) < 30:
-                return {"error": {"message": f"Not enough data for prediction. Got {len(close_prices)} points, need at least 30", "suggestion": "Try a different ticker or wait for more data to accumulate."}}
-        except Exception as e:
-            print(f"Error in /api/predict for {ticker}: {e}")
-            return {"error": {"message": f"Failed to fetch data: {str(e)}", "suggestion": "Try again later or contact support if the issue persists."}}
-    else:
-        close_prices = DATA_CACHE[ticker]["history"]
-    
+    days = min(max(req.days, 1), 30)
+
+    db = SessionLocal()
+
     try:
-        if len(close_prices) < 30:
-            return {"error": {"message": "Not enough data for prediction.", "suggestion": "Try a different ticker or wait for more data to accumulate."}}
-        
-        # Try ARIMA first, fallback to simple moving average if it fails
-        try:
-            close_series = pd.Series(close_prices)
-            model = ARIMA(close_series, order=(5,1,0))
-            model_fit = model.fit()
-            forecast = model_fit.forecast(steps=days)
-            return {"prediction": forecast.tolist(), "method": "ARIMA"}
-        except Exception as arima_error:
-            # Fallback to simple moving average
-            print(f"ARIMA failed for {ticker}: {arima_error}, using moving average")
-            recent_prices = close_prices[-10:]  # Last 10 prices
-            avg_change = np.mean(np.diff(recent_prices))
-            predictions = []
-            last_price = close_prices[-1]
-            for i in range(days):
-                next_price = last_price + avg_change * (i + 1)
-                predictions.append(next_price)
-            return {"prediction": predictions, "method": "Moving Average"}
-            
+        # 1. Read historical closing prices from SQLite.
+        rows = (
+            db.query(StockPrice)
+            .filter(StockPrice.ticker == ticker)
+            .order_by(StockPrice.trade_date.asc())
+            .all()
+        )
+
+        # 2. Fall back to Yahoo Finance if fewer than 30 records exist.
+        if len(rows) < 30:
+            data = yf.download(
+                ticker,
+                period="6mo",
+                interval="1d",
+                progress=False
+            )
+
+            if not data.empty:
+                if isinstance(data.columns, pd.MultiIndex):
+                    close_columns = [
+                        col for col in data.columns
+                        if "close" in str(col).lower()
+                    ]
+                    close = (
+                        data[close_columns[0]]
+                        if close_columns else pd.Series(dtype=float)
+                    )
+                elif "Close" in data.columns:
+                    close = data["Close"]
+                else:
+                    close = pd.Series(dtype=float)
+
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+
+                close = close.dropna()
+
+                # Persist fetched prices in SQLite.
+                existing_by_date = {
+                    row.trade_date: row for row in rows
+                }
+
+                for timestamp, price in close.items():
+                    trade_date = pd.Timestamp(timestamp).date()
+                    close_price = float(price)
+
+                    if trade_date in existing_by_date:
+                        existing_by_date[trade_date].close_price = close_price
+                    else:
+                        db.add(
+                            StockPrice(
+                                ticker=ticker,
+                                trade_date=trade_date,
+                                close_price=close_price
+                            )
+                        )
+
+                db.commit()
+
+                # Read the updated records from SQLite.
+                rows = (
+                    db.query(StockPrice)
+                    .filter(StockPrice.ticker == ticker)
+                    .order_by(StockPrice.trade_date.asc())
+                    .all()
+                )
+
+        if len(rows) < 30:
+            return {
+                "error": {
+                    "message": "Not enough historical data for prediction.",
+                    "suggestion": "Check the ticker symbol or try again later."
+                }
+            }
+
+        # 3. Use the stored prices as the prediction input.
+        close_prices = pd.Series(
+            [row.close_price for row in rows],
+            dtype=float
+        )
+
     except Exception as e:
-        print(f"Error in /api/predict for {ticker}: {e}")
-        return {"error": {"message": str(e), "suggestion": "Try again later or contact support if the issue persists."}}
+        db.rollback()
+        print(f"Error loading prediction data for {ticker}: {e}")
+        return {"error": {"message": str(e)}}
+
+    finally:
+        db.close()
+
+    # 4. Forecast future prices using the existing ARIMA model.
+    try:
+        model = ARIMA(close_prices, order=(5, 1, 0))
+        model_fit = model.fit()
+        forecast = model_fit.forecast(steps=days)
+
+        return {
+            "prediction": [float(value) for value in forecast.tolist()],
+            "method": "ARIMA"
+        }
+
+    except Exception as arima_error:
+        print(f"ARIMA failed for {ticker}: {arima_error}; using moving average")
+
+        recent_prices = close_prices.tail(10).tolist()
+        avg_change = float(np.mean(np.diff(recent_prices)))
+        last_price = float(recent_prices[-1])
+
+        predictions = [
+            last_price + avg_change * (i + 1)
+            for i in range(days)
+        ]
+
+        return {
+            "prediction": predictions,
+            "method": "Moving Average"
+        }
 
 @app.get("/api/test")
 def test_yfinance(ticker: str = "AAPL"):
