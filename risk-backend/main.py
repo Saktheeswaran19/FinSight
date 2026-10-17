@@ -116,6 +116,8 @@ def update_cache():
                         returns = close.pct_change().dropna()
                         volatility = float(np.std(returns) * np.sqrt(252))
                         var_99 = float(np.percentile(returns, 1))
+                        tail_losses = returns[returns <= var_99]
+                        cvar_99 = float(tail_losses.mean()) if len(tail_losses) > 0 else var_99
                         sharpe = float((np.mean(returns) * 252) / (np.std(returns) * np.sqrt(252))) if np.std(returns) != 0 else 0
                         downside_returns = returns[returns < 0]
                         downside_deviation = np.std(downside_returns) * np.sqrt(252) if len(downside_returns) > 0 else 0
@@ -137,6 +139,7 @@ def update_cache():
                             "metrics": {
                                 "volatility": volatility,
                                 "VaR_99": var_99,
+                                "CVaR_99": cvar_99,
                                 "sharpe_ratio": sharpe,
                                 "max_drawdown": max_drawdown,
                                 "sortino_ratio": sortino,
@@ -163,6 +166,125 @@ app.include_router(sentiment_router)
 @app.get("/api/assets")
 def get_assets() -> List[str]:
     return TICKERS
+
+@app.post("/api/assets/add")
+def add_asset(ticker: str = Query(..., description="Stock ticker symbol to add")) -> Dict:
+    clean_ticker = ticker.strip().upper()
+    if not clean_ticker:
+        return {"error": {"message": "Ticker symbol cannot be empty."}}
+
+    # Common ticker aliases & corporate renames
+    ALIASES = {
+        "ZOMATO": "ETERNAL.NS",
+        "ZOMATO.NS": "ETERNAL.NS",
+        "ZOMATO.BO": "ETERNAL.NS",
+        "APPLE": "AAPL",
+        "GOOGLE": "GOOGL",
+        "MICROSOFT": "MSFT",
+        "NVIDIA": "NVDA",
+        "TESLA": "TSLA",
+    }
+    was_aliased = clean_ticker in ALIASES
+    original_input = clean_ticker
+    if was_aliased:
+        clean_ticker = ALIASES[clean_ticker]
+
+    if clean_ticker in TICKERS:
+        msg = f"{clean_ticker} is already in the watchlist."
+        if was_aliased:
+            msg = f"'{original_input}' (listed as {clean_ticker}) is already in the watchlist."
+        return {"success": True, "ticker": clean_ticker, "message": msg}
+
+    # Verify and download data from Yahoo Finance
+    try:
+        data = yf.download(clean_ticker, period="6mo", interval="1d", progress=False)
+        if data.empty:
+            return {
+                "error": {
+                    "message": f"Ticker '{clean_ticker}' not found or has no price data on Yahoo Finance.",
+                    "suggestion": "Ensure the symbol is active. For Indian stocks on NSE, append .NS (e.g. ETERNAL.NS, PAYTM.NS, BEL.NS)."
+                }
+            }
+
+        close_col = None
+        if isinstance(data.columns, pd.MultiIndex):
+            for col in data.columns:
+                if "close" in str(col).lower():
+                    close_col = col
+                    break
+        elif "Close" in data.columns:
+            close_col = "Close"
+
+        if not close_col or close_col not in data.columns:
+            return {"error": {"message": f"Could not extract closing prices for '{clean_ticker}'."}}
+
+        close = data[close_col].dropna()
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = close if isinstance(close, pd.Series) else pd.Series(close)
+
+        if len(close) < 20:
+            return {"error": {"message": f"Insufficient historical data for '{clean_ticker}' (less than 20 trading days)."}}
+
+        # Save to SQLite database
+        save_stock_prices(clean_ticker, close)
+
+        # Calculate metrics for DATA_CACHE
+        returns = close.pct_change().dropna()
+        volatility = float(np.std(returns) * np.sqrt(252))
+        var_99 = float(np.percentile(returns, 1))
+        tail_losses = returns[returns <= var_99]
+        cvar_99 = float(tail_losses.mean()) if len(tail_losses) > 0 else var_99
+        sharpe = float((np.mean(returns) * 252) / (np.std(returns) * np.sqrt(252))) if np.std(returns) != 0 else 0
+        downside_returns = returns[returns < 0]
+        downside_deviation = np.std(downside_returns) * np.sqrt(252) if len(downside_returns) > 0 else 0
+        sortino = float((np.mean(returns) * 252) / downside_deviation) if downside_deviation != 0 else 0
+
+        consecutive_losses = 0
+        max_consecutive_losses = 0
+        for ret in returns:
+            if ret < 0:
+                consecutive_losses += 1
+                max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
+            else:
+                consecutive_losses = 0
+
+        annual_return = float(np.mean(returns) * 252)
+        roll_max = close.expanding().max()
+        daily_drawdown = (close / roll_max) - 1.0
+        max_drawdown = float(daily_drawdown.min())
+        calmar = float(annual_return / abs(max_drawdown)) if max_drawdown != 0 else 0
+
+        DATA_CACHE[clean_ticker] = {
+            "metrics": {
+                "volatility": volatility,
+                "VaR_99": var_99,
+                "CVaR_99": cvar_99,
+                "sharpe_ratio": sharpe,
+                "max_drawdown": max_drawdown,
+                "sortino_ratio": sortino,
+                "max_consecutive_losses": max_consecutive_losses,
+                "calmar_ratio": calmar,
+            },
+            "history": close.tolist(),
+            "dates": [str(d.date()) for d in close.index],
+        }
+
+        # Add to global TICKERS list
+        TICKERS.append(clean_ticker)
+
+        return {
+            "success": True,
+            "ticker": clean_ticker,
+            "message": (
+                f"{clean_ticker} (formerly {original_input}) successfully added and analyzed!"
+                if was_aliased else
+                f"{clean_ticker} successfully added and analyzed!"
+            )
+        }
+    except Exception as e:
+        return {"error": {"message": f"Failed to add {clean_ticker}: {str(e)}"}}
+
 
 @app.get("/api/metrics")
 def get_metrics(ticker: str = Query(..., description="Stock ticker symbol")) -> Dict:
@@ -201,6 +323,8 @@ def get_metrics(ticker: str = Query(..., description="Stock ticker symbol")) -> 
             # Calculate metrics with proper scaling
             volatility = float(np.std(returns) * np.sqrt(252))  # Annualized volatility
             var_99 = float(np.percentile(returns, 1))  # 1st percentile (99% confidence)
+            tail_losses = returns[returns <= var_99]
+            cvar_99 = float(tail_losses.mean()) if len(tail_losses) > 0 else var_99
             sharpe = float((np.mean(returns) * 252) / (np.std(returns) * np.sqrt(252))) if np.std(returns) != 0 else 0  # Annualized Sharpe
             
             # Additional risk metrics
@@ -232,6 +356,7 @@ def get_metrics(ticker: str = Query(..., description="Stock ticker symbol")) -> 
                 "metrics": {
                     "volatility": volatility,
                     "VaR_99": var_99,
+                    "CVaR_99": cvar_99,
                     "sharpe_ratio": sharpe,
                     "max_drawdown": max_drawdown,
                     "sortino_ratio": sortino,

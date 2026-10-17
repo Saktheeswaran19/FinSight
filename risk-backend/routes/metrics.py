@@ -105,6 +105,8 @@ def get_metrics(ticker: str = Query(..., description="Stock ticker symbol")):
         daily_std = float(np.std(returns))
         volatility = daily_std * np.sqrt(252)
         var_99 = float(np.percentile(returns, 1))
+        tail_losses = returns[returns <= var_99]
+        cvar_99 = float(tail_losses.mean()) if len(tail_losses) > 0 else var_99
 
         sharpe = (
             float((np.mean(returns) * 252) / (daily_std * np.sqrt(252)))
@@ -149,6 +151,7 @@ def get_metrics(ticker: str = Query(..., description="Stock ticker symbol")):
         result = {
             "volatility": float(volatility),
             "VaR_99": float(var_99),
+            "CVaR_99": float(cvar_99),
             "sharpe_ratio": float(sharpe),
             "max_drawdown": float(max_drawdown),
             "sortino_ratio": float(sortino),

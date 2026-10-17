@@ -12,7 +12,7 @@ import {
 import { formatCurrency } from '../utils/riskUtils';
 import { useTheme } from '../context/ThemeContext';
 
-const PriceChart = ({ data, comparisonData, title, height = 300 }) => {
+const PriceChart = ({ data, comparisonData, title, height = 300, ticker }) => {
   const { isDarkMode } = useTheme();
   
   // Combine main data with comparison data
@@ -57,9 +57,9 @@ const PriceChart = ({ data, comparisonData, title, height = 300 }) => {
   }, [data, comparisonData]);
 
   const formatTooltip = (value, name) => {
-    if (name === 'price') return [formatCurrency(value), 'Price'];
-    if (name === 'predicted') return [formatCurrency(value), 'Predicted'];
-    if (name === 'comparison') return [formatCurrency(value), 'Comparison'];
+    if (name === 'price') return [formatCurrency(value, ticker), 'Price'];
+    if (name === 'predicted') return [formatCurrency(value, ticker), 'Predicted'];
+    if (name === 'comparison') return [formatCurrency(value, ticker), 'Comparison'];
     return [value, name];
   };
 
@@ -70,7 +70,7 @@ const PriceChart = ({ data, comparisonData, title, height = 300 }) => {
           <p className={`text-sm font-medium ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{label}</p>
           {payload.map((entry, index) => (
             <p key={index} className="text-sm" style={{ color: entry.color }}>
-              {entry.name}: {formatCurrency(entry.value)}
+              {entry.name}: {formatCurrency(entry.value, ticker)}
             </p>
           ))}
         </div>
@@ -99,7 +99,7 @@ const PriceChart = ({ data, comparisonData, title, height = 300 }) => {
           <YAxis 
             stroke={isDarkMode ? '#9CA3AF' : '#6b7280'}
             fontSize={12}
-            tickFormatter={(value) => formatCurrency(value)}
+            tickFormatter={(value) => formatCurrency(value, ticker)}
           />
           <Tooltip content={<CustomTooltip />} />
           <Legend wrapperStyle={{ color: isDarkMode ? '#fff' : '#000' }} />

@@ -9,12 +9,28 @@ export const formatPercentage = (value) => {
   return `${(value * 100).toFixed(2)}%`;
 };
 
-export const formatCurrency = (value) => {
-  return new Intl.NumberFormat('en-IN', {
-    style: 'currency',
-    currency: 'INR',
-    maximumFractionDigits: 2,
-  }).format(value);
+export const isIndianStock = (ticker) => {
+  if (!ticker) return true;
+  const upper = String(ticker).trim().toUpperCase();
+  return upper.endsWith('.NS') || upper.endsWith('.BO');
+};
+
+export const formatCurrency = (value, ticker = null) => {
+  if (value === undefined || value === null || isNaN(value)) return '-';
+  const isIndian = ticker ? isIndianStock(ticker) : true;
+  if (isIndian) {
+    return new Intl.NumberFormat('en-IN', {
+      style: 'currency',
+      currency: 'INR',
+      maximumFractionDigits: 2,
+    }).format(value);
+  } else {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      maximumFractionDigits: 2,
+    }).format(value);
+  }
 };
 
 export const formatNumber = (value, decimals = 2) => {

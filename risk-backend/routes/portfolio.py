@@ -8,6 +8,83 @@ from models.stock_price import StockPrice
 
 router = APIRouter()
 
+def _load_aligned_prices(db, ticker_list: list) -> pd.DataFrame:
+    portfolio_data = {}
+    for ticker in ticker_list:
+        rows = (
+            db.query(StockPrice)
+            .filter(StockPrice.ticker == ticker)
+            .order_by(StockPrice.trade_date.asc())
+            .all()
+        )
+        if len(rows) < 30:
+            try:
+                data = yf.download(
+                    ticker,
+                    period="1y",
+                    interval="1d",
+                    progress=False
+                )
+                if not data.empty:
+                    if isinstance(data.columns, pd.MultiIndex):
+                        close_columns = [
+                            col for col in data.columns
+                            if "close" in str(col).lower()
+                        ]
+                        close = (
+                            data[close_columns[0]]
+                            if close_columns else pd.Series(dtype=float)
+                        )
+                    elif "Close" in data.columns:
+                        close = data["Close"]
+                    else:
+                        close = pd.Series(dtype=float)
+
+                    if isinstance(close, pd.DataFrame):
+                        close = close.iloc[:, 0]
+
+                    close = close.dropna()
+                    existing_by_date = {row.trade_date: row for row in rows}
+
+                    for timestamp, price in close.items():
+                        trade_date = pd.Timestamp(timestamp).date()
+                        close_price = float(price)
+
+                        if trade_date in existing_by_date:
+                            existing_by_date[trade_date].close_price = close_price
+                        else:
+                            db.add(
+                                StockPrice(
+                                    ticker=ticker,
+                                    trade_date=trade_date,
+                                    close_price=close_price
+                                )
+                            )
+
+                    db.commit()
+                    rows = (
+                        db.query(StockPrice)
+                        .filter(StockPrice.ticker == ticker)
+                        .order_by(StockPrice.trade_date.asc())
+                        .all()
+                    )
+            except Exception as e:
+                db.rollback()
+                print(f"Could not refresh {ticker}: {e}")
+
+        if len(rows) >= 30:
+            portfolio_data[ticker] = pd.Series(
+                [float(row.close_price) for row in rows],
+                index=pd.to_datetime([row.trade_date for row in rows]),
+                dtype=float
+            )
+
+    if len(portfolio_data) < 2:
+        return pd.DataFrame()
+
+    prices_df = pd.concat(portfolio_data, axis=1, join="inner").dropna().sort_index()
+    return prices_df
+
 @router.get("/api/portfolio")
 def portfolio_analysis(
     tickers: str = Query(..., description="Comma-separated ticker symbols"),
@@ -68,106 +145,13 @@ def portfolio_analysis(
                 print(f"Invalid portfolio weights: {e}")
                 weight_dict = None
 
-        portfolio_data = {}
-
         # Load each ticker's prices from SQLite.
-        for ticker in ticker_list:
-            rows = (
-                db.query(StockPrice)
-                .filter(StockPrice.ticker == ticker)
-                .order_by(StockPrice.trade_date.asc())
-                .all()
-            )
+        prices_df = _load_aligned_prices(db, ticker_list)
 
-            # Fetch and persist prices only when SQLite has insufficient data.
-            if len(rows) < 30:
-                try:
-                    data = yf.download(
-                        ticker,
-                        period="1y",
-                        interval="1d",
-                        progress=False
-                    )
-
-                    if not data.empty:
-                        if isinstance(data.columns, pd.MultiIndex):
-                            close_columns = [
-                                col for col in data.columns
-                                if "close" in str(col).lower()
-                            ]
-                            close = (
-                                data[close_columns[0]]
-                                if close_columns else pd.Series(dtype=float)
-                            )
-                        elif "Close" in data.columns:
-                            close = data["Close"]
-                        else:
-                            close = pd.Series(dtype=float)
-
-                        if isinstance(close, pd.DataFrame):
-                            close = close.iloc[:, 0]
-
-                        close = close.dropna()
-
-                        existing_by_date = {
-                            row.trade_date: row for row in rows
-                        }
-
-                        for timestamp, price in close.items():
-                            trade_date = pd.Timestamp(timestamp).date()
-                            close_price = float(price)
-
-                            if trade_date in existing_by_date:
-                                existing_by_date[trade_date].close_price = close_price
-                            else:
-                                db.add(
-                                    StockPrice(
-                                        ticker=ticker,
-                                        trade_date=trade_date,
-                                        close_price=close_price
-                                    )
-                                )
-
-                        db.commit()
-
-                        rows = (
-                            db.query(StockPrice)
-                            .filter(StockPrice.ticker == ticker)
-                            .order_by(StockPrice.trade_date.asc())
-                            .all()
-                        )
-
-                except Exception as e:
-                    db.rollback()
-                    print(f"Could not refresh {ticker}: {e}")
-
-                    # Use previously stored rows if a refresh fails.
-
-            if len(rows) >= 30:
-                portfolio_data[ticker] = pd.Series(
-                    [float(row.close_price) for row in rows],
-                    index=pd.to_datetime(
-                        [row.trade_date for row in rows]
-                    ),
-                    dtype=float
-                )
-
-        if len(portfolio_data) < 2:
+        if prices_df.empty or len(prices_df) < 30:
             return {
                 "error": {
-                    "message": "Not enough valid historical data for portfolio analysis",
-                    "suggestion": "Choose at least two assets with sufficient price history."
-                }
-            }
-
-        # Align prices by actual trading date, not by array position.
-        prices_df = pd.concat(portfolio_data, axis=1, join="inner")
-        prices_df = prices_df.dropna().sort_index()
-
-        if len(prices_df) < 30:
-            return {
-                "error": {
-                    "message": "Not enough overlapping historical data",
+                    "message": "Not enough overlapping historical data for portfolio analysis",
                     "suggestion": "Choose assets with more overlapping price history."
                 }
             }
@@ -245,3 +229,118 @@ def portfolio_analysis(
 
     finally:
         db.close()
+
+
+@router.get("/api/portfolio/optimize")
+def optimize_portfolio(
+    tickers: str = Query(..., description="Comma-separated ticker symbols"),
+    objective: str = Query("max_sharpe", description="'max_sharpe' or 'min_variance'"),
+    risk_free_rate: float = Query(0.06, description="Annual risk-free rate (e.g. 0.06 for 6%)")
+):
+    """
+    Markowitz Modern Portfolio Theory (MPT) Optimizer.
+    Finds optimal weights for Maximum Sharpe Ratio or Minimum Variance.
+    """
+    db = SessionLocal()
+
+    try:
+        from scipy.optimize import minimize
+
+        ticker_list = list(dict.fromkeys(
+            t.strip() for t in tickers.split(",") if t.strip()
+        ))
+
+        if len(ticker_list) < 2:
+            return {
+                "error": {
+                    "message": "Optimization requires at least 2 assets",
+                    "suggestion": "Select at least two assets to optimize portfolio weights."
+                }
+            }
+
+        prices_df = _load_aligned_prices(db, ticker_list)
+
+        if prices_df.empty or len(prices_df) < 30:
+            return {
+                "error": {
+                    "message": "Not enough overlapping price history to optimize",
+                    "suggestion": "Choose assets with more overlapping history."
+                }
+            }
+
+        returns = prices_df.pct_change().dropna()
+        if len(returns) < 20:
+            return {
+                "error": {
+                    "message": "Not enough return data for portfolio optimization"
+                }
+            }
+
+        mean_returns = returns.mean()
+        cov_matrix = returns.cov() * 252
+        num_assets = len(prices_df.columns)
+
+        def portfolio_performance(w):
+            w = np.array(w)
+            port_ret = float(np.sum(mean_returns * w) * 252)
+            port_vol = float(np.sqrt(np.dot(w.T, np.dot(cov_matrix, w))))
+            return port_ret, port_vol
+
+        if objective == "min_variance":
+            def loss_func(w):
+                return portfolio_performance(w)[1]
+        else:  # max_sharpe
+            def loss_func(w):
+                ret, vol = portfolio_performance(w)
+                sharpe = (ret - risk_free_rate) / vol if vol != 0 else 0
+                return -sharpe
+
+        constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
+        bounds = tuple((0.0, 1.0) for _ in range(num_assets))
+        init_guess = num_assets * [1.0 / num_assets]
+
+        opt_result = minimize(
+            loss_func,
+            init_guess,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints
+        )
+
+        if not opt_result.success:
+            opt_weights = [1.0 / num_assets] * num_assets
+        else:
+            opt_weights = [float(np.clip(w, 0, 1)) for w in opt_result.x]
+            total = sum(opt_weights)
+            if total > 0:
+                opt_weights = [w / total for w in opt_weights]
+
+        opt_ret, opt_vol = portfolio_performance(opt_weights)
+        opt_sharpe = (opt_ret - risk_free_rate) / opt_vol if opt_vol != 0 else 0.0
+
+        weights_dict = {
+            col: round(float(opt_weights[i]), 4)
+            for i, col in enumerate(prices_df.columns)
+        }
+
+        return {
+            "objective": objective,
+            "weights": weights_dict,
+            "expected_annual_return": round(float(opt_ret), 4),
+            "annual_volatility": round(float(opt_vol), 4),
+            "sharpe_ratio": round(float(opt_sharpe), 4),
+            "assets": list(prices_df.columns)
+        }
+
+    except Exception as e:
+        db.rollback()
+        print(f"Portfolio optimization error: {e}")
+        return {
+            "error": {
+                "message": f"Optimization failed: {str(e)}",
+                "suggestion": "Check asset symbols and try again."
+            }
+        }
+    finally:
+        db.close()
+

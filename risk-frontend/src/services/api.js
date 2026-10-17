@@ -20,6 +20,17 @@ export const apiService = {
     }
   },
 
+  // Add any custom asset ticker on the fly
+  addAsset: async (ticker) => {
+    try {
+      const response = await api.post(`/api/assets/add?ticker=${encodeURIComponent(ticker)}`);
+      return response.data;
+    } catch (error) {
+      console.error('Error adding asset:', error);
+      throw error;
+    }
+  },
+
   // Get risk metrics for a specific ticker
   getMetrics: async (ticker) => {
     try {
@@ -90,6 +101,18 @@ export const apiService = {
       return response.data;
     } catch (error) {
       console.error('Error fetching portfolio analysis:', error);
+      throw error;
+    }
+  },
+
+  // Markowitz Modern Portfolio Theory Optimizer
+  optimizePortfolio: async (tickers, objective = 'max_sharpe') => {
+    try {
+      const tickerString = Array.isArray(tickers) ? tickers.join(',') : tickers;
+      const response = await api.get(`/api/portfolio/optimize?tickers=${tickerString}&objective=${objective}`);
+      return response.data;
+    } catch (error) {
+      console.error('Error optimizing portfolio:', error);
       throw error;
     }
   },

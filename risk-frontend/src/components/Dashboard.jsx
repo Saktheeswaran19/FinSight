@@ -8,7 +8,10 @@ import {
   Target,
   Layers,
   Activity,
-  ArrowLeftRight
+  ArrowLeftRight,
+  ShieldAlert,
+  Download,
+  PlusCircle
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { apiService } from '../services/api';
@@ -28,6 +31,34 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [riskAlertThreshold, setRiskAlertThreshold] = useState(0.05);
+  const [newTickerInput, setNewTickerInput] = useState('');
+  const [isAddingTicker, setIsAddingTicker] = useState(false);
+  const [addTickerFeedback, setAddTickerFeedback] = useState(null);
+
+  const handleAddTicker = async () => {
+    const raw = newTickerInput.trim().toUpperCase();
+    if (!raw) return;
+    try {
+      setIsAddingTicker(true);
+      setAddTickerFeedback(null);
+      const res = await apiService.addAsset(raw);
+      if (res.error) {
+        setAddTickerFeedback({ type: 'error', message: res.error.message || 'Failed to add ticker.' });
+      } else {
+        setAddTickerFeedback({ type: 'success', message: res.message || `${res.ticker} added successfully!` });
+        if (!assets.includes(res.ticker)) {
+          setAssets(prev => [...prev, res.ticker]);
+        }
+        setSelectedAsset(res.ticker);
+        setNewTickerInput('');
+        loadAssetData(res.ticker);
+      }
+    } catch (err) {
+      setAddTickerFeedback({ type: 'error', message: err.message || 'Error communicating with server.' });
+    } finally {
+      setIsAddingTicker(false);
+    }
+  };
   const [dashboardError, setDashboardError] = useState(null);
   const [isComparing, setIsComparing] = useState(false);
   const [comparisonData, setComparisonData] = useState(null);
@@ -201,29 +232,48 @@ const Dashboard = () => {
     setSelectedAsset(asset);
   };
 
-  // Utility function to convert metrics to CSV and trigger download
+  // Utility function to convert metrics & historical prices to CSV and trigger download
   const exportMetricsToCSV = () => {
     const rows = [
-      ['Metric', 'Value'],
-      ['Volatility', metrics.volatility || 0],
-      ['VaR (99%)', metrics.VaR_99 || 0],
-      ['Sharpe Ratio', metrics.sharpe_ratio || 0],
-      ['Max Drawdown', metrics.max_drawdown || 0],
-      ['Sortino Ratio', metrics.sortino_ratio || 0],
-      ['Max Consecutive Losses', metrics.max_consecutive_losses || 0],
-      ['Calmar Ratio', metrics.calmar_ratio || 0],
+      ['=== FinSight Risk Analytics Report ==='],
+      ['Asset', selectedAsset || 'N/A'],
+      ['Generated At', new Date().toISOString()],
+      [],
+      ['--- Executive Risk Metrics ---'],
+      ['Metric', 'Value', 'Interpretation'],
+      ['Annualized Volatility', `${((metrics.volatility || 0) * 100).toFixed(2)}%`, 'Price fluctuation scale'],
+      ['Value at Risk (VaR 99%)', `${((metrics.VaR_99 || 0) * 100).toFixed(2)}%`, 'Maximum expected daily loss on 99% of days'],
+      ['CVaR (99% Expected Shortfall)', `${((metrics.CVaR_99 || metrics.VaR_99 || 0) * 100).toFixed(2)}%`, 'Average expected loss in worst 1% tail events'],
+      ['Sharpe Ratio', Number(metrics.sharpe_ratio || 0).toFixed(2), 'Risk-adjusted return'],
+      ['Sortino Ratio', Number(metrics.sortino_ratio || 0).toFixed(2), 'Downside risk-adjusted return'],
+      ['Maximum Drawdown', `${((metrics.max_drawdown || 0) * 100).toFixed(2)}%`, 'Worst peak-to-trough decline'],
+      ['Calmar Ratio', Number(metrics.calmar_ratio || 0).toFixed(2), 'Annual return vs max drawdown'],
+      ['Max Consecutive Losses', metrics.max_consecutive_losses || 0, 'Longest loss streak in days'],
+      [],
+      ['--- Historical Prices & Daily Returns ---'],
+      ['Date', 'Close Price', 'Daily Return (%)']
     ];
-    const csvContent = rows.map(e => e.join(",")).join("\n");
+
+    if (history && history.history && history.dates) {
+      history.history.forEach((price, idx) => {
+        const prevPrice = idx > 0 ? history.history[idx - 1] : null;
+        const dailyRet = prevPrice ? (((price - prevPrice) / prevPrice) * 100).toFixed(2) + '%' : '0.00%';
+        rows.push([history.dates[idx] || '', price, dailyRet]);
+      });
+    }
+
+    const csvContent = rows.map(e => e.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(",")).join("\n");
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    // Use file-saver if available, otherwise fallback to anchor
+    const filename = `${selectedAsset ? selectedAsset.replace(/[^a-zA-Z0-9_-]/g, '_') : 'asset'}_risk_report.csv`;
+
     if (window.navigator.msSaveOrOpenBlob) {
-      window.navigator.msSaveBlob(blob, 'risk_metrics.csv');
+      window.navigator.msSaveBlob(blob, filename);
     } else {
       const link = document.createElement('a');
       if (link.download !== undefined) {
         const url = URL.createObjectURL(blob);
         link.setAttribute('href', url);
-        link.setAttribute('download', 'risk_metrics.csv');
+        link.setAttribute('download', filename);
         link.style.visibility = 'hidden';
         document.body.appendChild(link);
         link.click();
@@ -331,22 +381,62 @@ const Dashboard = () => {
           <span className="ml-2 text-sm text-gray-700 dark:text-gray-300">{(riskAlertThreshold * 100).toFixed(1)}%</span>
         </div>
 
-        {/* Asset Selector */}
+        {/* Asset Selector & Dynamic Stock Addition */}
         <div className="mb-6">
-          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-            Select Asset
-          </label>
-          <select
-            value={selectedAsset}
-            onChange={(e) => handleAssetChange(e.target.value)}
-            className="block w-full max-w-xs px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-primary-500 focus:border-primary-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
-          >
-            {assets.map((asset) => (
-              <option key={asset} value={asset}>
-                {asset}
-              </option>
-            ))}
-          </select>
+          <div className="flex flex-col sm:flex-row sm:items-end gap-4">
+            <div className="w-full sm:w-64">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                Select Active Watchlist Asset
+              </label>
+              <select
+                value={selectedAsset}
+                onChange={(e) => handleAssetChange(e.target.value)}
+                className="block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-primary-500 focus:border-primary-500 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                {assets.map((asset) => (
+                  <option key={asset} value={asset}>
+                    {asset}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex-1 max-w-md">
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                Analyze Any Stock (NSE/BSE/Global)
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  placeholder="e.g. ETERNAL.NS (Zomato), AAPL, PAYTM.NS"
+                  value={newTickerInput}
+                  onChange={(e) => setNewTickerInput(e.target.value.toUpperCase())}
+                  onKeyDown={(e) => e.key === 'Enter' && handleAddTicker()}
+                  disabled={isAddingTicker}
+                  className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-primary-500"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddTicker}
+                  disabled={isAddingTicker || !newTickerInput.trim()}
+                  className="btn-primary flex items-center gap-1.5 px-4 py-2 text-sm rounded-md bg-primary-600 hover:bg-primary-700 disabled:opacity-50 text-white font-medium shadow whitespace-nowrap"
+                >
+                  <PlusCircle className="w-4 h-4" />
+                  {isAddingTicker ? 'Fetching...' : 'Add & Track'}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {addTickerFeedback && (
+            <div className={`mt-2 text-xs p-2 rounded max-w-lg ${
+              addTickerFeedback.type === 'error'
+                ? 'bg-red-50 text-red-700 dark:bg-red-950/30 dark:text-red-300 border border-red-200 dark:border-red-800'
+                : 'bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-300 border border-green-200 dark:border-green-800'
+            }`}>
+              {addTickerFeedback.message}
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
@@ -355,10 +445,12 @@ const Dashboard = () => {
             {/* Export Button */}
             <div className="flex justify-end mb-2">
               <button
-                className="btn-primary px-4 py-2 rounded shadow dark:bg-primary-600 dark:hover:bg-primary-700"
+                className="btn-primary px-4 py-2 rounded shadow dark:bg-primary-600 dark:hover:bg-primary-700 flex items-center gap-1.5 text-sm"
                 onClick={exportMetricsToCSV}
+                title="Download full risk report with metrics and historical prices"
               >
-                Export Metrics as CSV
+                <Download className="w-4 h-4" />
+                Export Risk Report (.CSV)
               </button>
             </div>
             {/* Fix: Always render advanced metrics and below, only replace the metrics grid with error if needed */}
@@ -438,9 +530,9 @@ const Dashboard = () => {
                 </div>
               )}
               {/* Advanced Risk Metrics */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mt-4">
                 {assetLoading ? (
-                  Array.from({ length: 3 }).map((_, index) => (
+                  Array.from({ length: 4 }).map((_, index) => (
                     <div key={index} className="metric-card bg-white dark:bg-gray-800 p-4 rounded-lg shadow animate-pulse">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center space-x-3">
@@ -456,18 +548,18 @@ const Dashboard = () => {
                 ) : selectedAsset && Object.keys(metrics).length > 0 ? (
                   <>
                     <MetricCard
+                      title="CVaR (99%)"
+                      value={metrics.CVaR_99 || 0}
+                      format="percentage"
+                      icon={ShieldAlert}
+                      subtitle="Expected Shortfall (tail risk)"
+                    />
+                    <MetricCard
                       title="Sortino Ratio"
                       value={metrics.sortino_ratio || 0}
                       format="number"
                       icon={TrendingUp}
                       subtitle="Downside risk-adjusted return"
-                    />
-                    <MetricCard
-                      title="Max Consecutive Losses"
-                      value={metrics.max_consecutive_losses || 0}
-                      format="number"
-                      icon={AlertTriangle}
-                      subtitle="Longest loss streak"
                     />
                     <MetricCard
                       title="Calmar Ratio"
@@ -476,10 +568,17 @@ const Dashboard = () => {
                       icon={BarChart3}
                       subtitle="Return vs. drawdown"
                     />
+                    <MetricCard
+                      title="Max Consecutive Losses"
+                      value={metrics.max_consecutive_losses || 0}
+                      format="number"
+                      icon={AlertTriangle}
+                      subtitle="Longest loss streak"
+                    />
                   </>
                 ) : (
                   // Empty state for advanced metrics
-                  Array.from({ length: 3 }).map((_, index) => (
+                  Array.from({ length: 4 }).map((_, index) => (
                     <div key={index} className="metric-card bg-white dark:bg-gray-800 p-4 rounded-lg shadow">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center space-x-3">
@@ -594,6 +693,7 @@ const Dashboard = () => {
                 comparisonData={comparisonData}
                 title={`${selectedAsset} Price History${isComparing ? ` (vs ${comparisonTimeFrame})` : ''}`}
                 height={400}
+                ticker={selectedAsset}
               />
             ) : selectedAsset ? (
               <div className="card bg-white dark:bg-gray-800 p-4 rounded-lg shadow">
@@ -645,7 +745,7 @@ const Dashboard = () => {
                   <div key={index} className="text-center p-4 bg-gray-50 rounded-lg">
                     <p className="text-sm text-gray-500">Day {index + 1}</p>
                     <p className="text-lg font-semibold text-gray-900">
-                      {formatCurrency(price)}
+                      {formatCurrency(price, selectedAsset)}
                     </p>
                   </div>
                 ))}

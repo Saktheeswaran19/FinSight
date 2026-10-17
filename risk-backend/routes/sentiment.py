@@ -80,6 +80,31 @@ def market_sentiment(ticker: str):
         current_ma20 = float(ma_20.iloc[-1])
         current_ma50 = float(ma_50.iloc[-1])
 
+        # 5b. Calculate MACD (12, 26, 9)
+        ema_12 = close.ewm(span=12, adjust=False).mean()
+        ema_26 = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema_12 - ema_26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = macd_line - signal_line
+
+        current_macd = float(macd_line.iloc[-1]) if pd.notna(macd_line.iloc[-1]) else 0.0
+        current_signal = float(signal_line.iloc[-1]) if pd.notna(signal_line.iloc[-1]) else 0.0
+        current_hist = float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else 0.0
+        macd_trend = "Bullish" if current_macd > current_signal else "Bearish"
+
+        # 5c. Calculate Bollinger Bands (20-day, 2 std)
+        bb_sma = ma_20
+        bb_std = close.rolling(window=20).std()
+        upper_band = bb_sma + (2 * bb_std)
+        lower_band = bb_sma - (2 * bb_std)
+
+        current_bb_upper = float(upper_band.iloc[-1]) if pd.notna(upper_band.iloc[-1]) else current_price
+        current_bb_lower = float(lower_band.iloc[-1]) if pd.notna(lower_band.iloc[-1]) else current_price
+        current_bb_middle = current_ma20
+        band_width = current_bb_upper - current_bb_lower
+        pct_b = float((current_price - current_bb_lower) / band_width) if band_width > 0 else 0.5
+        bb_position = "Overbought" if current_price >= current_bb_upper else ("Oversold" if current_price <= current_bb_lower else "Normal")
+
         # 6. Calculate RSI
         delta = close.diff()
         gains = delta.clip(lower=0)
@@ -136,6 +161,16 @@ def market_sentiment(ticker: str):
         if current_price < current_ma20 < current_ma50:
             signals.append("bearish_trend")
 
+        if current_macd > current_signal:
+            signals.append("macd_bullish_crossover")
+        else:
+            signals.append("macd_bearish_crossover")
+
+        if current_price >= current_bb_upper:
+            signals.append("bb_overbought")
+        elif current_price <= current_bb_lower:
+            signals.append("bb_oversold")
+
         if current_rsi > 70:
             signals.append("overbought")
         elif current_rsi < 30:
@@ -159,6 +194,11 @@ def market_sentiment(ticker: str):
         else:
             sentiment_score -= 1
 
+        if current_macd > current_signal:
+            sentiment_score += 1
+        else:
+            sentiment_score -= 1
+
         if current_rsi > 50:
             sentiment_score += 1
         else:
@@ -169,7 +209,7 @@ def market_sentiment(ticker: str):
         else:
             sentiment_score -= 1
 
-        # 11. Return the existing response structure
+        # 11. Return the comprehensive response structure
         return {
             "current_price": current_price,
             "moving_averages": {
@@ -180,6 +220,19 @@ def market_sentiment(ticker: str):
                 "rsi": current_rsi,
                 "momentum_5d": momentum_5d,
                 "momentum_20d": momentum_20d,
+                "macd": {
+                    "macd": current_macd,
+                    "signal": current_signal,
+                    "histogram": current_hist,
+                    "trend": macd_trend
+                },
+                "bollinger_bands": {
+                    "upper": current_bb_upper,
+                    "middle": current_bb_middle,
+                    "lower": current_bb_lower,
+                    "percent_b": pct_b,
+                    "position": bb_position
+                }
             },
             "volatility_trend": volatility_trend,
             "signals": signals,
