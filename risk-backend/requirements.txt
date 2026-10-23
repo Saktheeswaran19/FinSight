@@ -11,3 +11,5 @@ psutil
 # For modular imports and scheduling
 importlib-metadata; python_version<'3.8'
 sqlalchemy
+scipy
+psycopg2-binary

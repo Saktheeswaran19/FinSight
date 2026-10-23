@@ -77,3 +77,8 @@ yarn-error.log*
 # dotenv environment variables
 .env
 .env.* 
+
+# SQLite database and local cache
+*.db
+cache.json
+.venv/

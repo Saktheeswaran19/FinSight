@@ -1,16 +1,23 @@
 
+import os
 from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Store the database file in the backend folder.
+# Store SQLite locally by default, or connect to Postgres/Supabase if DATABASE_URL is set
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_URL = f"sqlite:///{(BASE_DIR / 'finance_risk.db').as_posix()}"
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{(BASE_DIR / 'finance_risk.db').as_posix()}")
+
+# Render and older Heroku postgres URLs start with postgres:// instead of postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args=connect_args,
 )
 
 SessionLocal = sessionmaker(
